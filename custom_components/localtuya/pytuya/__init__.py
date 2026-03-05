@@ -47,7 +47,9 @@ import time
 import weakref
 from abc import ABC, abstractmethod
 from collections import namedtuple
+from dataclasses import dataclass
 from hashlib import md5, sha256
+from typing import Any
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -495,6 +497,11 @@ class AESCipher:
             raise ValueError("invalid padding data")
         return s[:-padlen]
 
+@dataclass(slots=True)
+class Listener:
+    sem: asyncio.Semaphore
+    data: Any
+
 class MessageDispatcher(ContextualLogger):
     """Buffer and dispatcher for Tuya messages."""
 
@@ -504,12 +511,13 @@ class MessageDispatcher(ContextualLogger):
     HEARTBEAT_SEQNO = -100
     RESET_SEQNO = -101
     SESS_KEY_SEQNO = -102
+    CTRL_NEW_SEQNO = -103
 
     def __init__(self, dev_id, listener, protocol_version, local_key, enable_debug):
         """Initialize a new MessageBuffer."""
         super().__init__()
         self.buffer = b""
-        self.listeners = {}
+        self.listeners: dict[int, Listener] = {}
         self.listener = listener
         self.version = protocol_version
         self.local_key = local_key
@@ -517,13 +525,18 @@ class MessageDispatcher(ContextualLogger):
 
     def abort(self):
         """Abort all waiting clients."""
-        for key in self.listeners:
-            sem = self.listeners[key]
-            self.listeners[key] = None
+        for seq, entry in list(self.listeners.items()):
+            self.resolve(seq)
 
-            # TODO: Received data and semahore should be stored separately
-            if isinstance(sem, asyncio.Semaphore):
-                sem.release()
+    def resolve(self, seqno, data=None) -> bool:
+        """Resolve the waiter for a specific sequence number."""
+        entry = self.listeners.pop(seqno, None)
+        if not entry:
+            return False # no one is waiting (already timed out / already consumed)
+
+        entry.data = data
+        entry.sem.release()
+        return True
 
     async def wait_for(self, seqno, cmd, timeout=5):
         """Wait for response to a sequence number to be received and return it."""
@@ -531,17 +544,19 @@ class MessageDispatcher(ContextualLogger):
             raise Exception(f"listener exists for {seqno}")
 
         self.debug("Command %d waiting for seq. number %d", cmd, seqno)
-        self.listeners[seqno] = asyncio.Semaphore(0)
+        entry = Listener(asyncio.Semaphore(0), None)
+        self.listeners[seqno] = entry
+
         try:
-            await asyncio.wait_for(self.listeners[seqno].acquire(), timeout=timeout)
+            await asyncio.wait_for(entry.sem.acquire(), timeout=timeout)
         except asyncio.TimeoutError:
-            self.debug(
+            self.warning(
                 "Command %d timed out waiting for sequence number %d", cmd, seqno
             )
-            del self.listeners[seqno]
+            self.listeners.pop(seqno, None)
             raise
 
-        return self.listeners.pop(seqno)
+        return self.listeners.pop(seqno, entry).data
 
     def add_data(self, data):
         """Add new data to the buffer and try to parse messages."""
@@ -572,45 +587,38 @@ class MessageDispatcher(ContextualLogger):
 
     def _dispatch(self, msg):
         """Dispatch a message to someone that is listening."""
-        self.debug("Dispatching message CMD %r %s", msg.cmd, msg)
+        self.debug("Dispatching message CMD %r sz=%d %s", msg.cmd, len(msg.payload), msg)
+
         if msg.seqno in self.listeners:
             # self.debug("Dispatching sequence number %d", msg.seqno)
-            sem = self.listeners[msg.seqno]
-            if isinstance(sem, asyncio.Semaphore):
-                self.listeners[msg.seqno] = msg
-                sem.release()
-            else:
-                self.debug("Got additional message without request - skipping: %s", sem)
+            if not self.resolve(msg.seqno, msg):
+                self.debug("Got additional message without request - skipping: %r", msg)
         elif msg.cmd == HEART_BEAT:
             self.debug("Got heartbeat response")
             if self.HEARTBEAT_SEQNO in self.listeners:
-                sem = self.listeners[self.HEARTBEAT_SEQNO]
-                self.listeners[self.HEARTBEAT_SEQNO] = msg
-                sem.release()
+                self.resolve(self.HEARTBEAT_SEQNO, msg)
         elif msg.cmd == UPDATEDPS:
             self.debug("Got normal updatedps response")
             if self.RESET_SEQNO in self.listeners:
-                sem = self.listeners[self.RESET_SEQNO]
-                self.listeners[self.RESET_SEQNO] = msg
-                sem.release()
+                self.resolve(self.RESET_SEQNO, msg)
         elif msg.cmd == SESS_KEY_NEG_RESP:
             self.debug("Got key negotiation response")
             if self.SESS_KEY_SEQNO in self.listeners:
-                sem = self.listeners[self.SESS_KEY_SEQNO]
-                self.listeners[self.SESS_KEY_SEQNO] = msg
-                sem.release()
+                self.resolve(self.SESS_KEY_SEQNO, msg)
         elif msg.cmd == STATUS:
             if self.RESET_SEQNO in self.listeners:
                 self.debug("Got reset status update")
-                sem = self.listeners[self.RESET_SEQNO]
-                self.listeners[self.RESET_SEQNO] = msg
-                sem.release()
+                self.resolve(self.RESET_SEQNO, msg)
             else:
                 self.debug("Got status update")
                 self.listener(msg)
         else:
             if msg.cmd == CONTROL_NEW:
-                self.debug("Got ACK message for command %d: will ignore it", msg.cmd)
+                if self.version >= 3.5 and self.CTRL_NEW_SEQNO in self.listeners:
+                    self.debug("Got ACK message for CONTROL_NEW command 13")
+                    self.resolve(self.CTRL_NEW_SEQNO, msg)
+                else:
+                    self.debug("Got ACK message for command %d: will ignore it", msg.cmd)
             else:
                 self.debug(
                     "Got message type %d for unknown listener %d: %s",
@@ -862,6 +870,8 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
             seqno = MessageDispatcher.HEARTBEAT_SEQNO
         elif payload.cmd == UPDATEDPS:
             seqno = MessageDispatcher.RESET_SEQNO
+        elif payload.cmd == CONTROL_NEW and self.version >= 3.5:
+            seqno = MessageDispatcher.CTRL_NEW_SEQNO
 
         enc_payload = self._encode_message(payload)
         self.transport.write(enc_payload)
@@ -871,11 +881,14 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
             return None
 
         # TODO: Verify stuff, e.g. CRC sequence number?
-        if real_cmd in [HEART_BEAT, CONTROL, CONTROL_NEW] and len(msg.payload) == 0:
-            # device may send messages with empty payload in response
-            # to a HEART_BEAT or CONTROL or CONTROL_NEW command: consider them an ACK
-            self.debug("ACK received for command %d: ignoring it", real_cmd)
-            return None
+        if real_cmd in [HEART_BEAT, CONTROL, CONTROL_NEW]:
+            if len(msg.payload) == 0 or msg.payload == b"\x00\x00\x00\x00":
+                # [3.3,3.4] device may send empty messages, [3.5] device with 4 zero bytes payload in response
+                # to a HEART_BEAT or CONTROL or CONTROL_NEW command: consider them an ACK
+                self.debug("ACK received for command %d: ignoring it", real_cmd)
+                return None
+
+        # If we get here, it's a JSON-bearing reply so decode
         payload = self._decode_payload(msg.payload)
 
         # Perform a new exchange (once) if we switched device type
